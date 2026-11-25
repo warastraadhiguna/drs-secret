@@ -7,8 +7,10 @@ Detail kebutuhan bisnis ada di `docs/ANALISIS_KEBUTUHAN.md`.
 
 - Disalin pada **25 November 2026** dari proyek POS toko lain (`C:\angling\POS`,
   sistem kasir 1 cabang yang sudah dipakai harian). Riwayat git lama sengaja
-  **tidak** ikut — folder ini bukan repo git, dan tidak terhubung ke remote
-  GitHub proyek asal mana pun.
+  **tidak** ikut. Repo git sendiri: `origin` =
+  `https://github.com/warastraadhiguna/drs-secret.git`, branch **`master`**
+  (bukan `main`). `.gitignore` mengecualikan `.env`, `node_modules`,
+  `pos-admin/dist`, `server/backups`; `.gitattributes` memaksa `*.sh`/`*.conf` LF.
 - Dokumen proyek asal disimpan sebagai referensi di `docs/referensi-proyek-lama/`
   (`STATUS_PROYEK.md` = peta fitur & prinsip desain, `MVP_Blueprint_POS_1_Cabang.md`
   = rencana awal, `VPS_DEPLOY_TAHAP3.md` = contoh deploy ke VPS). Isinya
@@ -79,7 +81,7 @@ cd ../pos-admin && npm run build   # lalu buka http://localhost:4001
    skripnya DITAMBAHKAN ke daftar `STEPS` di `src/db/upgrade.js`
    (`npm run db:upgrade`, dijalankan otomatis oleh `deploy/update-on-server.sh`).
 3. `.env` berisi secret (JWT, password awal) — jangan ditampilkan ke luar,
-   jangan di-commit kalau nanti dibuat repo git.
+   jangan pernah di-commit (sudah di `.gitignore`).
 
 ## Prinsip desain data (warisan, tetap berlaku)
 
