@@ -1,0 +1,280 @@
+// Path RELATIF ("/api") — pos-admin SELALU disajikan dari server yang sama
+// dgn API-nya (server/src/app.js), jadi otomatis ikut host/IP apa pun yang
+// dipakai browser buat buka halaman ini. Absolut ke 127.0.0.1 sebelumnya
+// bikin gagal diakses dari komputer lain lewat IP LAN (fetch selalu nyasar
+// ke localhost komputer ITU SENDIRI, bukan server) — ditemukan 2026-08-07.
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api';
+const TOKEN_STORAGE_KEY = 'pos_admin_token';
+
+let authToken = localStorage.getItem(TOKEN_STORAGE_KEY) || null;
+
+export function setAuthToken(token) {
+  authToken = token;
+  if (token) localStorage.setItem(TOKEN_STORAGE_KEY, token);
+  else localStorage.removeItem(TOKEN_STORAGE_KEY);
+}
+
+export function getAuthToken() {
+  return authToken;
+}
+
+async function request(path, { method = 'GET', body, auth = true } = {}) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (auth && authToken) headers.Authorization = `Bearer ${authToken}`;
+
+  const res = await fetch(`${BASE_URL}${path}`, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(data.message || `Request gagal (${res.status})`);
+    err.code = data.error;
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+export const api = {
+  loginAdmin: (username, password) => request('/auth/login', { method: 'POST', body: { username, password }, auth: false }),
+  me: () => request('/auth/me'),
+  changeOwnPassword: ({ currentPassword, newPassword }) => request('/auth/change-password', { method: 'PUT', body: { currentPassword, newPassword } }),
+
+  listCategories: () => request('/categories'),
+  createCategory: (payload) => request('/categories', { method: 'POST', body: payload }),
+  updateCategory: (id, payload) => request(`/categories/${id}`, { method: 'PUT', body: payload }),
+
+  listUnits: () => request('/units'),
+  createUnit: (payload) => request('/units', { method: 'POST', body: payload }),
+  updateUnit: (id, payload) => request(`/units/${id}`, { method: 'PUT', body: payload }),
+
+  listPriceLevels: () => request('/price-levels'),
+  createPriceLevel: (payload) => request('/price-levels', { method: 'POST', body: payload }),
+  updatePriceLevel: (id, payload) => request(`/price-levels/${id}`, { method: 'PUT', body: payload }),
+
+  listProducts: ({ q, page, limit } = {}) => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (page) params.set('page', page);
+    if (limit) params.set('limit', limit);
+    const qs = params.toString();
+    return request(`/admin/products${qs ? `?${qs}` : ''}`);
+  },
+  searchProducts: (q) => request(`/products/search?q=${encodeURIComponent(q)}`),
+  getProduct: (id) => request(`/admin/products/${id}`),
+  getProductForSale: (id) => request(`/products/${id}/for-pos`),
+  listProductStock: () => request('/products/stock'),
+  listStockMovements: ({ productId, dateFrom, dateTo, movementType } = {}) => {
+    const params = new URLSearchParams();
+    if (productId) params.set('productId', productId);
+    if (dateFrom) params.set('dateFrom', dateFrom);
+    if (dateTo) params.set('dateTo', dateTo);
+    if (movementType) params.set('movementType', movementType);
+    const qs = params.toString();
+    return request(`/admin/stock/movements${qs ? `?${qs}` : ''}`);
+  },
+  createProduct: (payload) => request('/admin/products', { method: 'POST', body: payload }),
+  updateProduct: (id, payload) => request(`/admin/products/${id}`, { method: 'PUT', body: payload }),
+  deleteProduct: (id) => request(`/admin/products/${id}`, { method: 'DELETE' }),
+
+  addProductUnit: (productId, payload) => request(`/admin/products/${productId}/units`, { method: 'POST', body: payload }),
+  updateProductUnit: (productId, unitId, payload) => request(`/admin/products/${productId}/units/${unitId}`, { method: 'PUT', body: payload }),
+  deleteProductUnit: (productId, unitId) => request(`/admin/products/${productId}/units/${unitId}`, { method: 'DELETE' }),
+
+  addBarcode: (productId, payload) => request(`/admin/products/${productId}/barcodes`, { method: 'POST', body: payload }),
+  deleteBarcode: (productId, barcodeId) => request(`/admin/products/${productId}/barcodes/${barcodeId}`, { method: 'DELETE' }),
+
+  addPrice: (productId, payload) => request(`/admin/products/${productId}/prices`, { method: 'POST', body: payload }),
+  updatePrice: (productId, priceId, payload) => request(`/admin/products/${productId}/prices/${priceId}`, { method: 'PUT', body: payload }),
+  deletePrice: (productId, priceId) => request(`/admin/products/${productId}/prices/${priceId}`, { method: 'DELETE' }),
+
+  getDailySalesReport: (startDate, endDate) =>
+    request(`/admin/reports/daily-sales?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`),
+  getTransactionsReport: (startDate, endDate) =>
+    request(`/admin/reports/transactions?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`),
+  getSaleDetail: (saleId) => request(`/sales/${saleId}`),
+
+  listAllCashDenominations: () => request('/cash-denominations/all'),
+  createCashDenomination: (payload) => request('/cash-denominations', { method: 'POST', body: payload }),
+  updateCashDenomination: (id, payload) => request(`/cash-denominations/${id}`, { method: 'PUT', body: payload }),
+
+  listUsers: () => request('/admin/users'),
+  createUser: (payload) => request('/admin/users', { method: 'POST', body: payload }),
+  updateUser: (id, payload) => request(`/admin/users/${id}`, { method: 'PUT', body: payload }),
+  updateUserRole: (id, roleId) => request(`/admin/users/${id}/role`, { method: 'PUT', body: { roleId } }),
+  deleteUser: (id) => request(`/admin/users/${id}`, { method: 'DELETE' }),
+
+  getTotpStatus: (id) => request(`/admin/users/${id}/totp-setup`),
+  setupTotp: (id) => request(`/admin/users/${id}/totp-setup`, { method: 'POST' }),
+  disableTotp: (id) => request(`/admin/users/${id}/totp-setup`, { method: 'DELETE' }),
+
+  listRoles: () => request('/admin/roles'),
+  getPermissionsCatalog: () => request('/admin/roles/permissions-catalog'),
+  getRolePermissionIds: (roleId) => request(`/admin/roles/${roleId}/permissions`),
+  createRole: (payload) => request('/admin/roles', { method: 'POST', body: payload }),
+  updateRoleName: (roleId, payload) => request(`/admin/roles/${roleId}`, { method: 'PUT', body: payload }),
+  updateRolePermissions: (roleId, permissionIds) => request(`/admin/roles/${roleId}/permissions`, { method: 'PUT', body: { permissionIds } }),
+  deleteRole: (roleId) => request(`/admin/roles/${roleId}`, { method: 'DELETE' }),
+
+  listActivePaymentMethods: () => request('/payment-methods'),
+  listAllPaymentMethods: () => request('/payment-methods/all'),
+  createPaymentMethod: (payload) => request('/payment-methods', { method: 'POST', body: payload }),
+  updatePaymentMethod: (id, payload) => request(`/payment-methods/${id}`, { method: 'PUT', body: payload }),
+
+  listAccountingAccounts: () => request('/admin/accounting/accounts'),
+  postExpense: (payload) => request('/admin/accounting/expenses', { method: 'POST', body: payload }),
+  postOwnerDraw: (payload) => request('/admin/accounting/owner-draws', { method: 'POST', body: payload }),
+  listFixedAssets: () => request('/admin/accounting/fixed-assets'),
+  createFixedAsset: (payload) => request('/admin/accounting/fixed-assets', { method: 'POST', body: payload }),
+  runDepreciation: (payload) => request('/admin/accounting/fixed-assets/depreciation/run', { method: 'POST', body: payload }),
+
+  previewInventoryOpeningBalance: () => request('/admin/accounting/opening-balances/inventory/preview'),
+  runInventoryOpeningBalance: (payload) => request('/admin/accounting/opening-balances/inventory/run', { method: 'POST', body: payload }),
+
+  getTrialBalance: (asOfDate) => request(`/admin/accounting/reports/trial-balance?asOfDate=${encodeURIComponent(asOfDate)}`),
+  getIncomeStatement: (startDate, endDate) => request(`/admin/accounting/reports/income-statement?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`),
+  getBalanceSheet: (asOfDate) => request(`/admin/accounting/reports/balance-sheet?asOfDate=${encodeURIComponent(asOfDate)}`),
+  getCashFlow: (startDate, endDate) => request(`/admin/accounting/reports/cash-flow?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`),
+  getGeneralLedger: (accountId, startDate, endDate) => request(`/admin/accounting/reports/general-ledger?accountId=${encodeURIComponent(accountId)}&startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`),
+  getPpnSetoranReport: (startDate, endDate) => request(`/admin/accounting/reports/ppn-setoran?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`),
+
+  listAccountingPeriods: () => request('/admin/accounting/periods'),
+  closeAccountingPeriod: (payload) => request('/admin/accounting/periods/close', { method: 'POST', body: payload }),
+  reopenAccountingPeriod: (payload) => request('/admin/accounting/periods/reopen', { method: 'POST', body: payload }),
+
+  listAllSuppliers: () => request('/admin/suppliers/all'),
+  createSupplier: (payload) => request('/admin/suppliers', { method: 'POST', body: payload }),
+  updateSupplier: (id, payload) => request(`/admin/suppliers/${id}`, { method: 'PUT', body: payload }),
+
+  listPurchases: ({ q, dateFrom, dateTo, page, limit } = {}) => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (dateFrom) params.set('dateFrom', dateFrom);
+    if (dateTo) params.set('dateTo', dateTo);
+    if (page) params.set('page', page);
+    if (limit) params.set('limit', limit);
+    const qs = params.toString();
+    return request(`/admin/purchases${qs ? `?${qs}` : ''}`);
+  },
+  listPurchaseItemsByProduct: ({ q, dateFrom, dateTo, page, limit } = {}) => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (dateFrom) params.set('dateFrom', dateFrom);
+    if (dateTo) params.set('dateTo', dateTo);
+    if (page) params.set('page', page);
+    if (limit) params.set('limit', limit);
+    const qs = params.toString();
+    return request(`/admin/purchases/by-product${qs ? `?${qs}` : ''}`);
+  },
+  getPurchase: (id) => request(`/admin/purchases/${id}`),
+  createPurchase: (payload) => request('/admin/purchases', { method: 'POST', body: payload }),
+  voidPurchase: (id, payload) => request(`/admin/purchases/${id}/void`, { method: 'POST', body: payload }),
+
+  listPurchaseReturns: () => request('/admin/purchase-returns'),
+  createPurchaseReturn: (payload) => request('/admin/purchase-returns', { method: 'POST', body: payload }),
+
+  listSalesReturns: () => request('/admin/sales-returns'),
+  getSalesReturn: (id) => request(`/admin/sales-returns/${id}`),
+  lookupSaleForReturn: (saleNumber) => request(`/admin/sales-returns/lookup-sale?saleNumber=${encodeURIComponent(saleNumber)}`),
+  createSalesReturn: (payload) => request('/admin/sales-returns', { method: 'POST', body: payload }),
+
+  listInternalStockUsages: () => request('/admin/internal-stock-usage'),
+  getInternalStockUsage: (id) => request(`/admin/internal-stock-usage/${id}`),
+  createInternalStockUsage: (payload) => request('/admin/internal-stock-usage', { method: 'POST', body: payload }),
+  voidInternalStockUsage: (id, reason) => request(`/admin/internal-stock-usage/${id}/void`, { method: 'POST', body: { reason } }),
+
+  listPurchaseDrafts: () => request('/admin/purchase-drafts'),
+  createPurchaseDraft: (payload) => request('/admin/purchase-drafts', { method: 'POST', body: payload }),
+  deletePurchaseDraft: (id) => request(`/admin/purchase-drafts/${id}`, { method: 'DELETE' }),
+
+  listStockOpnames: () => request('/admin/stock-opnames'),
+  getStockOpname: (id) => request(`/admin/stock-opnames/${id}`),
+  createStockOpname: (payload) => request('/admin/stock-opnames', { method: 'POST', body: payload }),
+  recordOpnamePhysicalCount: (opnameId, itemId, payload) => request(`/admin/stock-opnames/${opnameId}/items/${itemId}`, { method: 'PUT', body: payload }),
+  finalizeStockOpname: (id) => request(`/admin/stock-opnames/${id}/finalize`, { method: 'POST' }),
+
+  getStoreSettings: () => request('/store-settings'),
+  updateStoreSettings: (payload) => request('/store-settings', { method: 'PUT', body: payload }),
+  updateInvoiceSettings: (payload) => request('/store-settings/invoice', { method: 'PUT', body: payload }),
+
+  listCustomers: ({ q, includeInactive, page, limit } = {}) => {
+    const params = new URLSearchParams();
+    if (q) params.set('q', q);
+    if (includeInactive) params.set('includeInactive', '1');
+    if (page) params.set('page', page);
+    if (limit) params.set('limit', limit);
+    return request(`/admin/customers?${params.toString()}`);
+  },
+  getCustomer: (id) => request(`/admin/customers/${id}`),
+  createCustomer: (payload) => request('/admin/customers', { method: 'POST', body: payload }),
+  updateCustomer: (id, payload) => request(`/admin/customers/${id}`, { method: 'PUT', body: payload }),
+
+  listOrders: (filters = {}) => {
+    const params = new URLSearchParams();
+    for (const [k, v] of Object.entries(filters)) if (v !== undefined && v !== null && v !== '') params.set(k, v);
+    return request(`/admin/orders?${params.toString()}`);
+  },
+  getOrder: (id) => request(`/admin/orders/${id}`),
+  quoteOrder: (payload) => request('/admin/orders/quote', { method: 'POST', body: payload }),
+  createOrder: (payload) => request('/admin/orders', { method: 'POST', body: payload }),
+  recordOrderPayment: (id, payload) => request(`/admin/orders/${id}/payments`, { method: 'POST', body: payload }),
+  voidOrderPayment: (id, paymentId, reason) => request(`/admin/orders/${id}/payments/${paymentId}/void`, { method: 'POST', body: { reason } }),
+  updateOrderShipping: (id, payload) => request(`/admin/orders/${id}/shipping`, { method: 'PUT', body: payload }),
+  fulfillOrderIndent: (id, itemIds) => request(`/admin/orders/${id}/fulfill`, { method: 'POST', body: { itemIds } }),
+  voidOrder: (id, reason) => request(`/admin/orders/${id}/void`, { method: 'POST', body: { reason } }),
+  listShippingMethods: () => request('/admin/orders/shipping-methods'),
+
+  getBvRecap: ({ startDate, endDate }) => request(`/admin/reports/bv?startDate=${startDate}&endDate=${endDate}`),
+  getSupplierPayablesSummary: () => request('/admin/supplier-payables/summary'),
+  listPayablePurchases: ({ supplierId, status } = {}) => {
+    const params = new URLSearchParams();
+    if (supplierId) params.set('supplierId', supplierId);
+    if (status) params.set('status', status);
+    return request(`/admin/supplier-payables/purchases?${params.toString()}`);
+  },
+  getPurchasePayable: (id) => request(`/admin/supplier-payables/purchases/${id}`),
+  recordSupplierPayment: (purchaseId, payload) => request(`/admin/supplier-payables/purchases/${purchaseId}/payments`, { method: 'POST', body: payload }),
+  voidSupplierPayment: (paymentId, reason) => request(`/admin/supplier-payables/payments/${paymentId}/void`, { method: 'POST', body: { reason } }),
+
+  listBundles: ({ includeInactive } = {}) => request(`/admin/bundles${includeInactive ? '?includeInactive=1' : ''}`),
+  createBundle: (payload) => request('/admin/bundles', { method: 'POST', body: payload }),
+  updateBundle: (id, payload) => request(`/admin/bundles/${id}`, { method: 'PUT', body: payload }),
+
+  getBackups: () => request('/admin/backups'),
+  updateBackupSettings: (payload) => request('/admin/backups/settings', { method: 'PUT', body: payload }),
+  runBackupNow: () => request('/admin/backups/run', { method: 'POST' }),
+  deleteBackup: (id) => request(`/admin/backups/${id}`, { method: 'DELETE' }),
+
+  // Bukan lewat request() biasa — respons endpoint ini file mentah (bukan
+  // JSON), dan perlu Authorization header (jadi tidak bisa pakai <a href>
+  // polos, browser tidak ikut kirim Bearer token pada navigasi biasa).
+  // Ambil sbg blob lewat fetch manual, lalu trigger save via object URL.
+  downloadBackup: async (id, filename) => {
+    const res = await fetch(`${BASE_URL}/admin/backups/${id}/download`, {
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new Error(data.message || `Gagal download (${res.status})`);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
+  getPricingSettings: () => request('/admin/pricing/settings'),
+  updatePricingSettings: (payload) => request('/admin/pricing/settings', { method: 'PUT', body: payload }),
+  listPriceChangeNotifications: () => request('/admin/pricing/notifications'),
+  countUnreadPriceChangeNotifications: () => request('/admin/pricing/notifications/unread-count'),
+  markPriceChangeNotificationRead: (id) => request(`/admin/pricing/notifications/${id}/read`, { method: 'PUT' }),
+  markAllPriceChangeNotificationsRead: () => request('/admin/pricing/notifications/read-all', { method: 'PUT' }),
+};

@@ -1,0 +1,958 @@
+const { v4: uuidv4 } = require("uuid");
+const Decimal = require("decimal.js");
+const pool = require("../config/db");
+const HttpError = require("../utils/HttpError");
+const { logActivity } = require("./AuthService");
+const { applyStockMovement } = require("./StockMovementService");
+const { resolvePrice } = require("./PricingService");
+const { getDefaultWarehouseId } = require("./WarehouseService");
+const { getActiveMethodById } = require("./PaymentMethodService");
+const JournalService = require("./JournalService");
+const PricingSettingsService = require("./PricingSettingsService");
+const StoreSettingsService = require("./StoreSettingsService");
+const BelowCostAuthorizationService = require("./BelowCostAuthorizationService");
+
+const BRANCH_ID = 1;
+
+function generateSaleNumber() {
+  const now = new Date();
+  // WAJIB pakai getter waktu lokal (bukan toISOString() yang UTC) di kedua
+  // bagian — sebelumnya datePart pakai toISOString() (UTC) sementara timePart
+  // pakai toTimeString() (lokal WIB), jadi nomor struk bisa menampilkan
+  // tanggal "kemarin" untuk transaksi jam 00:00-06:59 WIB walau created_at
+  // di database sudah benar. Ditemukan & dilaporkan user 2026-07-18.
+  const pad = (n) => String(n).padStart(2, "0");
+  const datePart = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}`;
+  const timePart = `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  const randomPart = Math.floor(100000 + Math.random() * 900000); // lihat catatan di AccountingService.generateEntryNumber
+  return `S${BRANCH_ID}-${datePart}-${timePart}${randomPart}`;
+}
+
+// Resolusi harga 1 item keranjang. Server adalah SATU-SATUNYA otoritas —
+// client tidak pernah mengirim harga, cuma productId/unitId/priceLevelId/qty
+// (+ diskon item kalau ada). Dipakai baik oleh preview (quote, read-only)
+// maupun checkout (di dalam transaksi). `conn` boleh pool (quote) atau
+// koneksi transaksi (checkout). `warehouseId` dibutuhkan utk baca HPP saat
+// ini (aturan besi diskon — lihat di bawah).
+//
+// item.discountType: 'percent' | 'rupiah' | null/undefined (tanpa diskon).
+// item.discountValue: angka — makna tergantung discountType (Batch 3B,
+// kasir pilih persen ATAU rupiah per baris).
+async function resolveItemPricing(conn, item, warehouseId) {
+  const { productId, unitId, priceLevelId } = item;
+  const quantity = new Decimal(item.quantity);
+
+  const [[productUnit]] = await conn.query(
+    `SELECT conversion_factor FROM product_units WHERE product_id = ? AND unit_id = ? LIMIT 1`,
+    [productId, unitId],
+  );
+  if (!productUnit) {
+    throw new HttpError(
+      400,
+      "invalid_unit",
+      `Satuan tidak valid untuk produk ${productId}`,
+    );
+  }
+  const conversionFactor = new Decimal(productUnit.conversion_factor);
+  const quantityBase = quantity.mul(conversionFactor);
+
+  const rawPrice = await resolvePrice(
+    { productId, unitId, priceLevelId, quantityBase: quantityBase.toFixed(4) },
+    conn,
+  );
+  // product_prices.price boleh punya pecahan (Batch 3A — harga hasil markup
+  // otomatis sengaja TIDAK dibulatkan di master). TAPI angka yang benar-benar
+  // dipakai di transaksi (quote & struk) WAJIB rupiah utuh — ini SATU-SATUNYA
+  // titik pembulatan, konsisten dgn "Uang = INT rupiah" (Bagian 5 poin 4).
+  // `priceDecimal` di sini = HARGA BAKU (harga master, sebelum harga manual
+  // kasir dipertimbangkan) — dipakai sebagai lantai/batas bawah harga manual
+  // di bawah, dan TIDAK PERNAH ditulis ulang ke product_prices (fitur harga
+  // manual murni per-transaksi, master tidak tersentuh).
+  const priceDecimal = new Decimal(rawPrice).toDecimalPlaces(
+    0,
+    Decimal.ROUND_HALF_UP,
+  );
+  const basePrice = priceDecimal;
+
+  const discountType =
+    item.discountType === "percent" || item.discountType === "rupiah"
+      ? item.discountType
+      : null;
+  const discountValue = new Decimal(item.discountValue || 0);
+  const hasItemDiscount = discountType !== null && discountValue.gt(0);
+
+  // Harga manual per item — kasir boleh NAIKKAN harga jual baris ini di atas
+  // harga baku (tidak pernah diturunkan), mutually exclusive dgn diskon item
+  // (keputusan klien: kalau salah satu sudah aktif, yang lain ditolak, bukan
+  // saling menimpa diam-diam). item.manualPrice absen/null = tidak dipakai
+  // (mis. kasir batalkan lewat "h0" di client, atau memang tidak pernah diisi).
+  const hasManualPrice =
+    item.manualPrice !== undefined &&
+    item.manualPrice !== null &&
+    item.manualPrice !== "";
+  if (hasManualPrice && hasItemDiscount) {
+    throw new HttpError(
+      400,
+      "manual_price_discount_conflict",
+      "Item tidak boleh punya harga manual dan diskon item sekaligus — batalkan salah satu dulu.",
+    );
+  }
+
+  let effectivePrice = priceDecimal;
+  let manualPriceApplied = false;
+  if (hasManualPrice) {
+    const manualPriceDecimal = new Decimal(item.manualPrice).toDecimalPlaces(
+      0,
+      Decimal.ROUND_HALF_UP,
+    );
+    if (manualPriceDecimal.lt(priceDecimal)) {
+      throw new HttpError(
+        400,
+        "manual_price_below_base",
+        `Harga manual tidak boleh di bawah harga baku Rp${priceDecimal.toFixed(0)}`,
+      );
+    }
+    effectivePrice = manualPriceDecimal;
+    manualPriceApplied = true;
+  }
+
+  const price = effectivePrice.toFixed(0);
+  const grossSubtotal = effectivePrice.mul(quantity);
+
+  let discountAmount;
+  if (discountType === "percent") {
+    if (discountValue.lt(0) || discountValue.gt(100)) {
+      throw new HttpError(
+        400,
+        "bad_request",
+        "Diskon persen item harus antara 0-100",
+      );
+    }
+    discountAmount = grossSubtotal.mul(discountValue.div(100));
+  } else if (discountType === "rupiah") {
+    if (discountValue.lt(0)) {
+      throw new HttpError(
+        400,
+        "bad_request",
+        "Diskon rupiah item tidak boleh negatif",
+      );
+    }
+    discountAmount = discountValue;
+  } else {
+    discountAmount = new Decimal(0);
+  }
+
+  const subtotal = grossSubtotal.minus(discountAmount);
+  if (subtotal.lt(0)) {
+    throw new HttpError(
+      400,
+      "invalid_discount",
+      "Diskon melebihi subtotal item",
+    );
+  }
+
+  // Aturan besi (sama seperti Batch 3A): harga jual tidak pernah boleh di
+  // bawah HPP — di sini diterapkan ke diskon PER ITEM. Baca HPP rata-rata
+  // SAAT INI (bukan snapshot lama), plain SELECT (bukan FOR UPDATE — ini
+  // guard bisnis, bukan pengunci kuantitas; pengecekan stok yang sungguhan
+  // tetap FOR UPDATE terpisah di createSale).
+  const [[balanceRow]] = await conn.query(
+    `SELECT avg_cost_per_base_unit FROM stock_balances WHERE warehouse_id = ? AND product_id = ?`,
+    [warehouseId, productId],
+  );
+  const avgCost = balanceRow
+    ? new Decimal(balanceRow.avg_cost_per_base_unit)
+    : new Decimal(0);
+  const costInUnit = avgCost.mul(conversionFactor);
+  const itemTotalCost = costInUnit.mul(quantity);
+  // Aturan besi: harga jual tidak pernah boleh di bawah HPP — TAPI sejak
+  // fitur "Otorisasi Jual di Bawah HPP" (Owner/kode TOTP), pelanggaran ini
+  // TIDAK langsung dilempar di sini lagi — cuma ditandai (isBelowCost +
+  // pesan siap pakai). Keputusan lempar error ATAU izinkan lanjut ada di
+  // pemanggil (previewSale/createSale), karena cuma pemanggil yang tahu
+  // apakah checkout ini sedang membawa otorisasi yang valid.
+  const isBelowCost = subtotal.lt(itemTotalCost);
+  let belowCostErrorCode = null;
+  let belowCostMessage = null;
+  if (isBelowCost) {
+    if (discountAmount.isZero()) {
+      // Harga jual (baku ATAU manual) ITU SENDIRI sudah di bawah HPP, TANPA
+      // diskon apa pun ikut campur — pesan error TIDAK BOLEH menyalahkan
+      // diskon (dilaporkan user: pesan lama selalu bilang "diskon item"
+      // walau discountAmount=0, padahal penyebabnya harga baku/HPP, bukan
+      // diskon — membingungkan krn kasir/admin memang tidak pakai diskon).
+      belowCostErrorCode = "price_below_cost";
+      belowCostMessage = `Harga jual produk ini (Rp${effectivePrice.toFixed(0)}/satuan) sudah di bawah HPP (Rp${costInUnit.toFixed(2)}/satuan). Naikkan harga jual produk ini dulu (menu Produk > Harga) sebelum bisa dijual.`;
+    } else {
+      const maxDiscount = grossSubtotal.minus(itemTotalCost);
+      belowCostErrorCode = "discount_below_cost";
+      belowCostMessage = `Diskon item membuat harga di bawah HPP (Rp${costInUnit.toFixed(2)}/satuan). Maksimal diskon utk baris ini Rp${maxDiscount.toFixed(0)}.`;
+    }
+  }
+
+  return {
+    productId,
+    unitId,
+    quantity,
+    conversionFactor,
+    quantityBase,
+    price,
+    priceDecimal,
+    basePrice,
+    manualPriceApplied,
+    grossSubtotal,
+    discountType,
+    discountValue,
+    discountAmount,
+    subtotal,
+    itemTotalCost,
+    isBelowCost,
+    belowCostErrorCode,
+    belowCostMessage,
+  };
+}
+
+// Hitung diskon TOTAL (nota) — persen ATAU rupiah, diterapkan DI ATAS jumlah
+// subtotal item (subtotal setelah semua diskon per item, BUKAN subtotal
+// kotor) — sesuai keputusan klien Batch 3B.
+function computeTotalDiscount(
+  { totalDiscountType, totalDiscountValue },
+  subtotalAfterItemDiscount,
+) {
+  const type =
+    totalDiscountType === "percent" || totalDiscountType === "rupiah"
+      ? totalDiscountType
+      : null;
+  const value = new Decimal(totalDiscountValue || 0);
+  if (type === "percent") {
+    if (value.lt(0) || value.gt(100)) {
+      throw new HttpError(
+        400,
+        "bad_request",
+        "Diskon persen total harus antara 0-100",
+      );
+    }
+    return {
+      type,
+      value,
+      amount: subtotalAfterItemDiscount.mul(value.div(100)),
+    };
+  }
+  if (type === "rupiah") {
+    if (value.lt(0)) {
+      throw new HttpError(
+        400,
+        "bad_request",
+        "Diskon rupiah total tidak boleh negatif",
+      );
+    }
+    return { type, value, amount: value };
+  }
+  return { type: null, value: new Decimal(0), amount: new Decimal(0) };
+}
+
+// PPN (Batch 3C) — dihitung SETELAH diskon, dari `nilaiSetelahDiskon` (nilai
+// nota bersih dari semua diskon item+total — ini adalah `grandTotal` versi
+// SEBELUM PPN dipertimbangkan). Dua mode, dikunci klien:
+//  - exclude: PPN DITAMBAHKAN di atas. DPP = nilaiSetelahDiskon (apa
+//    adanya), PPN = DPP * tarif, total baru = DPP + PPN (BERTAMBAH).
+//  - included: nilaiSetelahDiskon SUDAH termasuk PPN. DPP = nilaiSetelahDiskon
+//    / (1 + tarif), PPN = nilaiSetelahDiskon - DPP — BUKAN
+//    nilaiSetelahDiskon * tarif (itu keliru, PPN jadi kelebihan hitung).
+//    Total TIDAK berubah (PPN cuma "dipisahkan" utk ditampilkan/dijurnal).
+//
+// Pembulatan: DPP dibulatkan LEBIH DULU ke rupiah utuh, lalu PPN diambil
+// sbg SISA (bukan dibulatkan independen) — supaya DPP+PPN dijamin PERSIS
+// sama dengan total akhir. Kalau keduanya dibulatkan sendiri-sendiri, bisa
+// selisih Rp1 karena pembulatan dan bikin jurnal GAGAL balance
+// (postJournalEntry menolak jurnal yang tidak persis balance).
+function applyPpn(nilaiSetelahDiskon, ppnSettings) {
+  const ppnEnabled = !!ppnSettings.ppn_enabled;
+  const ppnMode = ppnSettings.ppn_mode;
+  if (
+    !ppnEnabled ||
+    !ppnSettings.ppn_rate ||
+    (ppnMode !== "exclude" && ppnMode !== "included")
+  ) {
+    return {
+      ppnApplied: false,
+      dpp: nilaiSetelahDiskon,
+      ppnAmount: new Decimal(0),
+      grandTotal: nilaiSetelahDiskon,
+      ppnRate: null,
+      ppnMode: null,
+    };
+  }
+
+  const rate = new Decimal(ppnSettings.ppn_rate);
+  if (ppnMode === "exclude") {
+    const dpp = nilaiSetelahDiskon; // sudah rupiah utuh (selisih 2 angka bulat)
+    const ppnAmount = dpp
+      .mul(rate.div(100))
+      .toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+    const grandTotal = dpp.plus(ppnAmount);
+    return {
+      ppnApplied: true,
+      dpp,
+      ppnAmount,
+      grandTotal,
+      ppnRate: rate,
+      ppnMode,
+    };
+  }
+
+  // included
+  const dppRaw = nilaiSetelahDiskon.div(rate.div(100).plus(1));
+  const dpp = dppRaw.toDecimalPlaces(0, Decimal.ROUND_HALF_UP);
+  const ppnAmount = nilaiSetelahDiskon.minus(dpp); // sisa — lihat catatan pembulatan di atas
+  return {
+    ppnApplied: true,
+    dpp,
+    ppnAmount,
+    grandTotal: nilaiSetelahDiskon,
+    ppnRate: rate,
+    ppnMode,
+  };
+}
+
+// PPN Keluaran cuma berlaku di mode PKP (fitur tax_mode) — di mode
+// non-PKP dipaksa OFF di sini, TERLEPAS dari status ppn_enabled di
+// pricing_settings. Sengaja begitu (bukan menghapus pengaturan PPN-nya)
+// supaya kalau toko balik jadi PKP lagi, tarif/mode yang sudah diatur
+// admin otomatis aktif lagi tanpa perlu diisi ulang dari nol.
+async function getEffectivePpnSettings() {
+  const [ppnSettings, storeSettings] = await Promise.all([
+    PricingSettingsService.getSettings(),
+    StoreSettingsService.getSettings(),
+  ]);
+  if (storeSettings.tax_mode === "non_pkp") {
+    return { ...ppnSettings, ppn_enabled: 0 };
+  }
+  return ppnSettings;
+}
+
+// Preview harga keranjang TANPA menyimpan apa pun (tidak mengunci stok,
+// tidak menulis stock_movements). Dipakai client utk menampilkan harga —
+// client tidak pernah menghitung harga sendiri, cuma menampilkan hasil ini.
+// items: [{ productId, unitId, quantity, priceLevelId, discountType?, discountValue? }]
+// totalDiscountType/totalDiscountValue: diskon nota (Batch 3B), lihat computeTotalDiscount.
+// allowBelowCost: dipakai UI otorisasi (kasir) utk menampilkan total yang
+// BENAR selagi proses minta Kode Otorisasi berlangsung — preview murni
+// read-only (tidak commit apa pun), jadi aman diminta bebas oleh client.
+// Gerbang yang SUNGGUHAN (memvalidasi reason/token) cuma ada di createSale.
+async function previewSale({
+  items,
+  totalDiscountType = null,
+  totalDiscountValue = 0,
+  allowBelowCost = false,
+}) {
+  if (!items || items.length === 0) {
+    return {
+      items: [],
+      subtotal: "0",
+      itemDiscountTotal: "0",
+      subtotalAfterItemDiscount: "0",
+      totalDiscountType: null,
+      totalDiscountValue: "0",
+      totalDiscountAmount: "0",
+      discountTotal: "0",
+      dpp: "0",
+      ppnEnabled: false,
+      ppnRate: null,
+      ppnMode: null,
+      ppnAmount: "0",
+      grandTotal: "0",
+    };
+  }
+
+  const warehouseId = await getDefaultWarehouseId();
+  let subtotalSum = new Decimal(0); // kotor, SUM(harga*qty) SEBELUM diskon apa pun
+  let itemDiscountSum = new Decimal(0);
+  let totalCostSum = new Decimal(0);
+  const itemResults = [];
+
+  for (const item of items) {
+    const pricing = await resolveItemPricing(pool, item, warehouseId);
+    if (pricing.isBelowCost && !allowBelowCost) {
+      throw new HttpError(400, pricing.belowCostErrorCode, pricing.belowCostMessage);
+    }
+
+    const [[balance]] = await pool.query(
+      `SELECT qty_base FROM stock_balances WHERE warehouse_id = ? AND product_id = ?`,
+      [warehouseId, pricing.productId],
+    );
+    const availableQty = new Decimal(balance ? balance.qty_base : 0);
+
+    itemResults.push({
+      productId: pricing.productId,
+      unitId: pricing.unitId,
+      quantity: pricing.quantity.toFixed(4),
+      price: pricing.price,
+      basePrice: pricing.basePrice.toFixed(0),
+      manualPriceApplied: pricing.manualPriceApplied,
+      grossSubtotal: pricing.grossSubtotal.toFixed(0),
+      discountType: pricing.discountType,
+      discountValue: pricing.discountValue.toFixed(4),
+      discountAmount: pricing.discountAmount.toFixed(0),
+      subtotal: pricing.subtotal.toFixed(0),
+      inStock: availableQty.gte(pricing.quantityBase),
+      availableQty: availableQty.toFixed(4),
+      isBelowCost: pricing.isBelowCost,
+    });
+
+    subtotalSum = subtotalSum.plus(pricing.grossSubtotal);
+    itemDiscountSum = itemDiscountSum.plus(pricing.discountAmount);
+    totalCostSum = totalCostSum.plus(pricing.itemTotalCost);
+  }
+
+  const subtotalAfterItemDiscount = subtotalSum.minus(itemDiscountSum);
+  const totalDiscount = computeTotalDiscount(
+    { totalDiscountType, totalDiscountValue },
+    subtotalAfterItemDiscount,
+  );
+  const grandTotal = subtotalAfterItemDiscount.minus(totalDiscount.amount);
+  if (grandTotal.lt(0)) {
+    throw new HttpError(
+      400,
+      "invalid_discount",
+      "Diskon total melebihi subtotal",
+    );
+  }
+  // Aturan besi utk diskon TOTAL: nota secara keseluruhan tidak boleh terjual
+  // di bawah total HPP-nya (diskon item sudah dijaga sendiri-sendiri di atas;
+  // ini lapis kedua khusus utk diskon nota, yang tidak diatribusikan ke item
+  // tertentu — lihat catatan di createSale).
+  const notaBelowCost = grandTotal.lt(totalCostSum);
+  if (notaBelowCost && !allowBelowCost) {
+    const maxTotalDiscount = subtotalAfterItemDiscount.minus(totalCostSum);
+    throw new HttpError(
+      400,
+      "discount_below_cost",
+      `Diskon total membuat nota terjual di bawah total HPP (Rp${totalCostSum.toFixed(0)}). Maksimal diskon total Rp${maxTotalDiscount.toFixed(0)}.`,
+    );
+  }
+
+  // PPN (Batch 3C) — dihitung dari nilai SETELAH diskon (`grandTotal` di
+  // atas, sebelum PPN dipertimbangkan). Floor HPP SUDAH selesai diperiksa
+  // di atas terhadap nilai pre-PPN — PPN bukan pendapatan/beban, tidak ikut
+  // dibandingkan ke HPP.
+  const ppnSettings = await getEffectivePpnSettings();
+  const ppn = applyPpn(grandTotal, ppnSettings);
+
+  return {
+    items: itemResults,
+    subtotal: subtotalSum.toFixed(0),
+    itemDiscountTotal: itemDiscountSum.toFixed(0),
+    subtotalAfterItemDiscount: subtotalAfterItemDiscount.toFixed(0),
+    totalDiscountType: totalDiscount.type,
+    totalDiscountValue: totalDiscount.value.toFixed(4),
+    totalDiscountAmount: totalDiscount.amount.toFixed(0),
+    discountTotal: itemDiscountSum.plus(totalDiscount.amount).toFixed(0),
+    dpp: ppn.dpp.toFixed(0),
+    ppnEnabled: ppn.ppnApplied,
+    ppnRate: ppn.ppnRate ? ppn.ppnRate.toFixed(4) : null,
+    ppnMode: ppn.ppnMode,
+    ppnAmount: ppn.ppnAmount.toFixed(0),
+    grandTotal: ppn.grandTotal.toFixed(0),
+    totalCost: totalCostSum.toFixed(0),
+    isBelowCost: itemResults.some((it) => it.isBelowCost) || notaBelowCost,
+  };
+}
+
+// items: [{ productId, unitId, quantity, priceLevelId, discountType?, discountValue? }]
+// totalDiscountType/totalDiscountValue: diskon nota (Batch 3B).
+// cashTendered: jumlah uang tunai yang diserahkan pelanggan (mentah, bukan
+// hasil hitungan client) — cuma wajib & dipakai untuk metode pembayaran tunai
+// (is_cash=1). Untuk metode non-tunai (QRIS, kartu, dst) tidak ada kembalian,
+// server yang menetapkan cashTendered = grandTotal & changeDue = 0.
+// Server yang menghitung grandTotal & kembalian — client cuma menampilkan
+// apa yang dikembalikan di sini.
+// belowCostReason/belowCostAuthToken: jalur "Otorisasi Jual di Bawah HPP" —
+// keduanya OPSIONAL & TIDAK PERNAH mengubah perilaku kalau nota ternyata
+// tidak menyentuh HPP sama sekali. `userRole` dipakai SEKALI di sini utk
+// menentukan apakah user yg checkout boleh otorisasi LANGSUNG (role-nya
+// punya izin sales.sell_below_cost, mis. "Owner" login sendiri) — kalau
+// tidak, satu-satunya jalan lolos adalah belowCostAuthToken valid (dari
+// BelowCostAuthorizationService.verifyAndIssueToken, lihat route kode TOTP).
+async function createSale({
+  userId,
+  userRole,
+  shiftId,
+  items,
+  paymentMethodId,
+  cashTendered,
+  totalDiscountType = null,
+  totalDiscountValue = 0,
+  customerName = null,
+  belowCostReason = null,
+  belowCostAuthToken = null,
+}) {
+  if (!items || items.length === 0) {
+    throw new HttpError(400, "bad_request", "Keranjang kosong");
+  }
+  if (!paymentMethodId) {
+    throw new HttpError(400, "bad_request", "paymentMethodId wajib diisi");
+  }
+
+  const trimmedBelowCostReason = (belowCostReason || "").trim();
+  const isOwnerDirect = trimmedBelowCostReason
+    ? await BelowCostAuthorizationService.roleHasSellBelowCostPermission(userRole)
+    : false;
+  // "Percobaan otorisasi" = alasan sudah diisi — TITIK. Sengaja TIDAK ikut
+  // mensyaratkan isOwnerDirect/token di sini (beda dari draft awal): kalau
+  // disyaratkan, kasir yang BUKAN Owner dan BELUM punya token akan tetap
+  // kena pesan floor HPP yang generik, bukan diarahkan ke alur minta Kode
+  // Otorisasi. Dengan cuma mensyaratkan alasan, alur di bawah (blok
+  // "anyItemBelowCost || notaBelowCost") yang menentukan lolos langsung
+  // (Owner), perlu token (kasir biasa, belum ada token -> error
+  // 'authorization_required', SINYAL bagi UI kasir utk menampilkan input
+  // kode), atau token tidak valid ('authorization_invalid'). Request TANPA
+  // alasan sama sekali (kasir belum coba apa-apa) tetap dapat pesan floor
+  // HPP asli seperti sebelum fitur ini ada.
+  const belowCostOverrideAttempted = !!trimmedBelowCostReason;
+  const paymentMethod = await getActiveMethodById(paymentMethodId);
+  if (
+    paymentMethod.is_cash &&
+    (cashTendered === undefined || cashTendered === null)
+  ) {
+    throw new HttpError(
+      400,
+      "bad_request",
+      "cashTendered wajib diisi untuk pembayaran tunai",
+    );
+  }
+
+  const warehouseId = await getDefaultWarehouseId();
+  const saleId = uuidv4();
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    // Pastikan shift ini benar-benar milik user & masih terbuka (dikunci row-nya
+    // supaya tidak ada dua checkout bersamaan menutup shift yang sama).
+    const [[shift]] = await conn.query(
+      `SELECT * FROM cashier_shifts WHERE id = ? FOR UPDATE`,
+      [shiftId],
+    );
+    if (!shift || shift.user_id !== userId || shift.status !== "open") {
+      throw new HttpError(
+        409,
+        "shift_not_open",
+        "Shift kasir tidak aktif untuk user ini",
+      );
+    }
+
+    let subtotalSum = new Decimal(0); // kotor, SUM(harga*qty) SEBELUM diskon apa pun
+    let itemDiscountSum = new Decimal(0);
+    let totalCostSum = new Decimal(0);
+    let anyItemBelowCost = false;
+    const itemRows = [];
+    const itemDiscountNotes = [];
+    const manualPriceNotes = [];
+
+    for (const item of items) {
+      const pricing = await resolveItemPricing(conn, item, warehouseId);
+      if (pricing.isBelowCost) {
+        if (!belowCostOverrideAttempted) {
+          throw new HttpError(400, pricing.belowCostErrorCode, pricing.belowCostMessage);
+        }
+        anyItemBelowCost = true;
+      }
+      if (pricing.discountAmount.gt(0)) {
+        itemDiscountNotes.push(
+          pricing.discountType === "percent"
+            ? `${pricing.productId}: ${pricing.discountValue.toFixed(2)}% (Rp${pricing.discountAmount.toFixed(0)})`
+            : `${pricing.productId}: Rp${pricing.discountAmount.toFixed(0)}`,
+        );
+      }
+      if (pricing.manualPriceApplied) {
+        manualPriceNotes.push(
+          `${pricing.productId}: harga baku Rp${pricing.basePrice.toFixed(0)} -> harga manual Rp${pricing.price}`,
+        );
+      }
+
+      // Cek stok cukup sebelum commit ke movement (hindari stok minus tanpa sengaja)
+      const [[balance]] = await conn.query(
+        `SELECT qty_base FROM stock_balances WHERE warehouse_id = ? AND product_id = ? FOR UPDATE`,
+        [warehouseId, pricing.productId],
+      );
+      const currentQty = new Decimal(balance ? balance.qty_base : 0);
+      if (currentQty.lt(pricing.quantityBase)) {
+        throw new HttpError(
+          409,
+          "insufficient_stock",
+          `Stok tidak cukup untuk produk ${pricing.productId}`,
+        );
+      }
+
+      const { avgCostPerBaseUnit } = await applyStockMovement(conn, {
+        warehouseId,
+        productId: pricing.productId,
+        movementType: "sale",
+        referenceType: "sale",
+        referenceUuid: saleId,
+        qtyOutBase: pricing.quantityBase.toFixed(4),
+        movementDate: new Date(),
+      });
+
+      const totalCost = avgCostPerBaseUnit.mul(pricing.quantityBase);
+      const grossProfit = pricing.subtotal.minus(totalCost);
+
+      itemRows.push({
+        id: uuidv4(),
+        productId: pricing.productId,
+        unitId: pricing.unitId,
+        quantity: pricing.quantity.toFixed(4),
+        conversionFactor: pricing.conversionFactor.toFixed(4),
+        quantityBase: pricing.quantityBase.toFixed(4),
+        sellingPrice: pricing.price,
+        discountAmount: pricing.discountAmount.toFixed(0),
+        subtotal: pricing.subtotal.toFixed(0),
+        costPerBaseUnit: avgCostPerBaseUnit.toFixed(4),
+        totalCost: totalCost.toFixed(4),
+        grossProfit: grossProfit.toFixed(4),
+      });
+
+      subtotalSum = subtotalSum.plus(pricing.grossSubtotal);
+      itemDiscountSum = itemDiscountSum.plus(pricing.discountAmount);
+      totalCostSum = totalCostSum.plus(totalCost);
+    }
+
+    const subtotalAfterItemDiscount = subtotalSum.minus(itemDiscountSum);
+    const totalDiscount = computeTotalDiscount(
+      { totalDiscountType, totalDiscountValue },
+      subtotalAfterItemDiscount,
+    );
+    const grandTotal = subtotalAfterItemDiscount.minus(totalDiscount.amount);
+    if (grandTotal.lt(0)) {
+      throw new HttpError(
+        400,
+        "invalid_discount",
+        "Diskon total melebihi subtotal",
+      );
+    }
+    // Aturan besi lapis kedua (lihat catatan sama di previewSale): diskon
+    // TOTAL tidak diatribusikan ke item tertentu, jadi diperiksa terhadap
+    // total HPP SELURUH nota, bukan per baris.
+    const notaBelowCost = grandTotal.lt(totalCostSum);
+    if (notaBelowCost && !belowCostOverrideAttempted) {
+      const maxTotalDiscount = subtotalAfterItemDiscount.minus(totalCostSum);
+      throw new HttpError(
+        400,
+        "discount_below_cost",
+        `Diskon total membuat nota terjual di bawah total HPP (Rp${totalCostSum.toFixed(0)}). Maksimal diskon total Rp${maxTotalDiscount.toFixed(0)}.`,
+      );
+    }
+    const discountSum = itemDiscountSum.plus(totalDiscount.amount);
+
+    // Nota ini SUNGGUHAN butuh otorisasi (bukan cuma "jaga-jaga" dari
+    // client) — validasi & "bakar" otorisasinya SEKARANG, di dalam
+    // transaksi yang sama (kalau gagal di bawah ini/langkah manapun
+    // setelahnya, seluruh nota rollback lewat catch, TERMASUK konsumsi
+    // token-nya — konsisten, tidak ada token "hangus" tanpa nota jadi).
+    let belowCostAuthorizedByUserId = null;
+    if (anyItemBelowCost || notaBelowCost) {
+      if (isOwnerDirect) {
+        belowCostAuthorizedByUserId = userId; // Owner mengotorisasi transaksinya sendiri
+      } else {
+        if (!belowCostAuthToken) {
+          throw new HttpError(
+            403,
+            "authorization_required",
+            "Nota ini di bawah HPP — perlu Kode Otorisasi dari Owner sebelum bisa dibayar.",
+          );
+        }
+        const { authorizedByUserId } = await BelowCostAuthorizationService.consumeToken(conn, {
+          token: belowCostAuthToken,
+          requestedByUserId: userId,
+          saleId,
+        });
+        belowCostAuthorizedByUserId = authorizedByUserId;
+      }
+    }
+
+    // PPN (Batch 3C) — dihitung dari nilai SETELAH diskon (`grandTotal` di
+    // atas). Floor HPP sudah selesai diperiksa di atas terhadap nilai
+    // pre-PPN — PPN bukan pendapatan, tidak ikut dibandingkan ke HPP. Semua
+    // pemakaian "total transaksi" MULAI SINI WAJIB pakai ppn.grandTotal
+    // (bukan `grandTotal` mentah lagi), supaya PPN benar2 ikut ditagih/dibayar.
+    const ppnSettings = await getEffectivePpnSettings();
+    const ppn = applyPpn(grandTotal, ppnSettings);
+
+    let cashTenderedDecimal;
+    let changeDue;
+    if (paymentMethod.is_cash) {
+      cashTenderedDecimal = new Decimal(cashTendered);
+      if (cashTenderedDecimal.lt(ppn.grandTotal)) {
+        throw new HttpError(
+          400,
+          "insufficient_cash",
+          `Uang tunai (${cashTenderedDecimal}) kurang dari total belanja (${ppn.grandTotal})`,
+        );
+      }
+      changeDue = cashTenderedDecimal.minus(ppn.grandTotal);
+    } else {
+      // Non-tunai: tidak ada kembalian, jumlah yang "diserahkan" = tepat ppn.grandTotal.
+      cashTenderedDecimal = ppn.grandTotal;
+      changeDue = new Decimal(0);
+    }
+
+    // Laba kotor = pendapatan BERSIH PPN (DPP) dikurangi HPP — PPN adalah
+    // titipan pajak (utang ke negara), bukan pendapatan, jadi TIDAK boleh
+    // ikut dianggap laba (beda dari sebelum Batch 3C, di mana grandTotal
+    // = DPP karena belum ada PPN sama sekali).
+    const grossProfitSum = ppn.dpp.minus(totalCostSum);
+    const saleNumber = generateSaleNumber();
+
+    await conn.query(
+      `INSERT INTO sales
+        (id, branch_id, sale_number, cashier_shift_id, user_id, customer_name,
+         subtotal, discount_total, dpp, ppn_rate, ppn_mode, ppn_amount, grand_total, total_cost, gross_profit, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed')`,
+      [
+        saleId,
+        BRANCH_ID,
+        saleNumber,
+        shiftId,
+        userId,
+        customerName,
+        subtotalSum.toFixed(0),
+        discountSum.toFixed(0),
+        ppn.dpp.toFixed(0),
+        ppn.ppnRate ? ppn.ppnRate.toFixed(4) : null,
+        ppn.ppnMode,
+        ppn.ppnAmount.toFixed(0),
+        ppn.grandTotal.toFixed(0),
+        totalCostSum.toFixed(4),
+        grossProfitSum.toFixed(4),
+      ],
+    );
+
+    for (const row of itemRows) {
+      await conn.query(
+        `INSERT INTO sale_items
+          (id, sale_id, product_id, unit_id, quantity, conversion_factor, quantity_base,
+           selling_price, discount_amount, subtotal, cost_per_base_unit, total_cost, gross_profit)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          row.id,
+          saleId,
+          row.productId,
+          row.unitId,
+          row.quantity,
+          row.conversionFactor,
+          row.quantityBase,
+          row.sellingPrice,
+          row.discountAmount,
+          row.subtotal,
+          row.costPerBaseUnit,
+          row.totalCost,
+          row.grossProfit,
+        ],
+      );
+    }
+
+    // sale_payments.amount = jumlah yang DITERAPKAN ke invoice (= grand_total),
+    // bukan uang fisik yang diserahkan pelanggan. Kembalian mengalir keluar
+    // lagi dalam transaksi yang sama, jadi efek bersih ke laci = grand_total —
+    // ini yang dipakai ShiftService.calculateExpectedCash utk rekonsiliasi kas
+    // (cuma menjumlah baris yang payment_methods.is_cash = 1).
+    await conn.query(
+      `INSERT INTO sale_payments (id, sale_id, payment_method_id, payment_method_name, amount) VALUES (?, ?, ?, ?, ?)`,
+      [
+        uuidv4(),
+        saleId,
+        paymentMethod.id,
+        paymentMethod.name,
+        ppn.grandTotal.toFixed(0),
+      ],
+    );
+
+    // Diskon manual wajib tercatat ke activity_logs — siapa (userId, sudah
+    // jadi parameter logActivity) & berapa (rincian per item + total di
+    // description). Batch 3B: berlaku sama utk diskon persen maupun rupiah.
+    if (discountSum.gt(0)) {
+      const parts = [];
+      if (itemDiscountNotes.length > 0)
+        parts.push(`diskon item: ${itemDiscountNotes.join("; ")}`);
+      if (totalDiscount.amount.gt(0)) {
+        parts.push(
+          `diskon total: ${totalDiscount.type === "percent" ? `${totalDiscount.value.toFixed(2)}%` : `Rp${totalDiscount.amount.toFixed(0)}`} (Rp${totalDiscount.amount.toFixed(0)})`,
+        );
+      }
+      await logActivity(conn, {
+        userId,
+        action: "manual_discount",
+        entityType: "sale",
+        entityUuid: saleId,
+        description: `Diskon manual pada transaksi ${saleNumber} — ${parts.join("; ")} — total diskon Rp${discountSum.toFixed(0)}`,
+      });
+    }
+
+    // Harga manual wajib tercatat ke activity_logs juga (konsisten dgn kontrol
+    // diskon di atas) — siapa, item apa, harga baku -> harga manual per baris.
+    // Entry TERPISAH dari 'manual_discount' (bukan digabung) karena keduanya
+    // mutually exclusive per item tapi bisa hidup bareng dlm SATU nota kalau
+    // item A pakai diskon & item B pakai harga manual sekaligus.
+    if (manualPriceNotes.length > 0) {
+      await logActivity(conn, {
+        userId,
+        action: "manual_price",
+        entityType: "sale",
+        entityUuid: saleId,
+        description: `Harga manual pada transaksi ${saleNumber} — ${manualPriceNotes.join("; ")}`,
+      });
+    }
+
+    // Jual di bawah HPP (fitur Kode Otorisasi) wajib tercatat ke
+    // activity_logs — siapa yang checkout, siapa yang mengotorisasi
+    // (bisa sama kalau Owner login sendiri), alasannya, & selisih rugi
+    // level nota (totalCostSum vs grandTotal pre-PPN — bisa saja masih
+    // positif kalau cuma SEBAGIAN item yang di bawah HPP, item lain
+    // menutupinya; itu tetap dicatat apa adanya, bukan disembunyikan).
+    if (belowCostAuthorizedByUserId) {
+      const lossAmount = totalCostSum.minus(grandTotal);
+      await logActivity(conn, {
+        userId,
+        action: "sell_below_cost",
+        entityType: "sale",
+        entityUuid: saleId,
+        description: `Jual di bawah HPP pada transaksi ${saleNumber} — alasan: ${trimmedBelowCostReason} — diotorisasi oleh user ${belowCostAuthorizedByUserId}${belowCostAuthorizedByUserId === userId ? " (Owner sendiri)" : ""} — HPP nota Rp${totalCostSum.toFixed(0)} vs harga jual Rp${grandTotal.toFixed(0)} (${lossAmount.gt(0) ? `rugi Rp${lossAmount.toFixed(0)}` : "tetap untung di level nota"})`,
+      });
+    }
+
+    // Jurnal akuntansi (feature/accounting Lapis 2) — panggilan eksplisit,
+    // di dalam transaksi yang sama, SEBELUM commit: kalau jurnal gagal
+    // (mis. tidak balance), seluruh sale ikut rollback lewat catch di bawah.
+    // Tidak mengubah alur/hasil checkout yang sudah ada — cuma tambahan.
+    await JournalService.postSaleJournals(conn, {
+      saleId,
+      saleNumber,
+      entryDate: new Date(),
+      subtotal: subtotalSum,
+      discountTotal: discountSum,
+      ppnAmount: ppn.ppnAmount,
+      ppnMode: ppn.ppnMode,
+      grandTotal: ppn.grandTotal,
+      totalCost: totalCostSum,
+      isCashPayment: !!paymentMethod.is_cash,
+      createdBy: userId,
+    });
+
+    await conn.commit();
+
+    return {
+      id: saleId,
+      saleNumber,
+      subtotal: subtotalSum.toFixed(0),
+      itemDiscountTotal: itemDiscountSum.toFixed(0),
+      subtotalAfterItemDiscount: subtotalAfterItemDiscount.toFixed(0),
+      totalDiscountType: totalDiscount.type,
+      totalDiscountValue: totalDiscount.value.toFixed(4),
+      totalDiscountAmount: totalDiscount.amount.toFixed(0),
+      discountTotal: discountSum.toFixed(0),
+      dpp: ppn.dpp.toFixed(0),
+      ppnEnabled: ppn.ppnApplied,
+      ppnRate: ppn.ppnRate ? ppn.ppnRate.toFixed(4) : null,
+      ppnMode: ppn.ppnMode,
+      ppnAmount: ppn.ppnAmount.toFixed(0),
+      grandTotal: ppn.grandTotal.toFixed(0),
+      cashTendered: cashTenderedDecimal.toFixed(0),
+      changeDue: changeDue.toFixed(0),
+      paymentMethodId: paymentMethod.id,
+      paymentMethodName: paymentMethod.name,
+      isCashPayment: !!paymentMethod.is_cash,
+      items: itemRows,
+    };
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+// Detail lengkap 1 transaksi lama — dipakai popup "Lihat Detail" di panel
+// Laporan Shift (kasir mau cetak ulang struk). Otorisasi SAMA seperti void:
+// cuma kasir pemilik transaksi atau admin yang boleh lihat.
+//
+// CATATAN PENTING soal cetak ulang: `cashTendered`/`changeDue` (uang tunai
+// yang diserahkan pelanggan & kembaliannya) TIDAK PERNAH disimpan di
+// database — cuma ada sesaat di response checkout asli, lalu hilang.
+// Sengaja begitu sejak awal (bukan bug), karena kembalian bukan angka yang
+// perlu diaudit ulang (beda dgn grand_total/subtotal/PPN yang semuanya
+// snapshot permanen). Jadi utk cetak ulang, tunai diasumsikan PAS sejumlah
+// grand_total (kembalian Rp0) — SATU-SATUNYA cara reprint tanpa data yang
+// memang tidak pernah tersimpan. Nilai asli (kalau kasir dulu menerima lebih
+// dari itu) tidak bisa direkonstruksi dari mana pun.
+async function getSaleDetail(saleId, requestingUserId, requestingUserRole) {
+  const [[sale]] = await pool.query(`SELECT * FROM sales WHERE id = ?`, [
+    saleId,
+  ]);
+  if (!sale) {
+    throw new HttpError(404, "sale_not_found", "Transaksi tidak ditemukan");
+  }
+  if (requestingUserRole !== "admin" && sale.user_id !== requestingUserId) {
+    throw new HttpError(403, "forbidden", "Bukan transaksi kasir ini");
+  }
+
+  const [items] = await pool.query(
+    `SELECT si.quantity, si.selling_price, si.discount_amount, si.subtotal, p.name AS product_name
+     FROM sale_items si
+     JOIN products p ON p.id = si.product_id
+     WHERE si.sale_id = ?
+     ORDER BY si.created_at ASC`,
+    [saleId],
+  );
+
+  const [[payment]] = await pool.query(
+    `SELECT sp.payment_method_name, pm.is_cash
+     FROM sale_payments sp
+     LEFT JOIN payment_methods pm ON pm.id = sp.payment_method_id
+     WHERE sp.sale_id = ? LIMIT 1`,
+    [saleId],
+  );
+  const isCashPayment = !!(payment && payment.is_cash);
+  const grandTotal = String(sale.grand_total);
+
+  return {
+    id: sale.id,
+    saleNumber: sale.sale_number,
+    status: sale.status,
+    voided: sale.status === "voided",
+    voidReason: sale.void_reason,
+    createdAt: sale.created_at,
+    subtotal: String(sale.subtotal),
+    discountTotal: String(sale.discount_total),
+    dpp: String(sale.dpp),
+    ppnEnabled: sale.ppn_rate !== null,
+    ppnRate: sale.ppn_rate,
+    ppnMode: sale.ppn_mode,
+    ppnAmount: String(sale.ppn_amount),
+    grandTotal,
+    paymentMethodName: payment ? payment.payment_method_name : "Tunai",
+    isCashPayment,
+    cashTendered: grandTotal, // lihat catatan di atas — asumsi uang pas
+    changeDue: "0",
+    items: items.map((it) => ({
+      productName: it.product_name,
+      quantity: it.quantity,
+      sellingPrice: it.selling_price,
+      discountAmount: it.discount_amount,
+      subtotal: it.subtotal,
+    })),
+  };
+}
+
+module.exports = {
+  createSale,
+  previewSale,
+  getSaleDetail,
+  // Dipakai ulang OrderService (Invoice/Pesanan) — satu sumber aturan harga,
+  // diskon, PPN, supaya invoice & kasir tidak bisa beda hitungan.
+  resolveItemPricing,
+  computeTotalDiscount,
+  applyPpn,
+  getEffectivePpnSettings,
+};

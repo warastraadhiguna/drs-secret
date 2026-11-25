@@ -1,0 +1,4 @@
+# Skrip & config yg dijalankan di server Linux WAJIB berakhiran LF
+*.sh   text eol=lf
+*.conf text eol=lf
+deploy/ecosystem.config.js text eol=lf

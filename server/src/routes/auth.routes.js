@@ -1,0 +1,93 @@
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+const AuthService = require('../services/AuthService');
+const asyncHandler = require('../utils/asyncHandler');
+const HttpError = require('../utils/HttpError');
+const { requireAuth } = require('../middleware/auth');
+
+const router = express.Router();
+
+// Rate limit per-IP di level jaringan, terpisah dari lockout per-akun di
+// AuthService (yang menghitung percobaan gagal per user). Ini menahan brute
+// force yang mencoba banyak username/PIN berbeda dari satu sumber.
+const loginRateLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'too_many_requests', message: 'Terlalu banyak percobaan login, coba lagi sebentar lagi.' },
+});
+
+// POST /api/auth/login  — login admin (username + password)
+router.post(
+  '/login',
+  loginRateLimiter,
+  asyncHandler(async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      throw new HttpError(400, 'bad_request', 'username dan password wajib diisi');
+    }
+    const result = await AuthService.loginAdmin(username, password);
+    res.json(result);
+  })
+);
+
+// GET /api/auth/cashiers — daftar kasir aktif utk layar pilih-kasir
+router.get(
+  '/cashiers',
+  asyncHandler(async (req, res) => {
+    const cashiers = await AuthService.listActiveCashiers();
+    res.json({ cashiers });
+  })
+);
+
+// POST /api/auth/login-pin — login kasir (pilih user_id + PIN)
+router.post(
+  '/login-pin',
+  loginRateLimiter,
+  asyncHandler(async (req, res) => {
+    const { userId, pin } = req.body;
+    if (!userId || !pin) {
+      throw new HttpError(400, 'bad_request', 'userId dan pin wajib diisi');
+    }
+    const result = await AuthService.loginCashierWithPin(userId, pin);
+    res.json(result);
+  })
+);
+
+// GET /api/auth/me — cek token & ambil identitas user saat ini. Bentuk
+// respons SENGAJA disamakan persis dgn user di respons POST /login
+// (full_name, bukan fullName mentah dari payload token) — pos-admin
+// memakai /me ini utk isi ulang session.user setelah refresh halaman,
+// harus konsisten dgn bentuk yang didapat dari login baru. Izin role juga
+// disertakan, fresh dari DB tiap panggil (lihat AuthService.getRolePermissions)
+// — dipakai pos-admin utk filter visibilitas menu.
+router.get(
+  '/me',
+  requireAuth,
+  asyncHandler(async (req, res) => {
+    const { isSuperadmin, permissions } = await AuthService.getRolePermissions(req.user.role);
+    res.json({
+      user: { id: req.user.id, role: req.user.role, full_name: req.user.fullName, isSuperadmin, permissions },
+    });
+  })
+);
+
+// PUT /api/auth/change-password — user ganti password MILIKNYA SENDIRI
+// (dropdown profil pos-admin). userId selalu dari token, bukan body — lihat
+// catatan lengkap di AuthService.changeOwnPassword.
+router.put(
+  '/change-password',
+  requireAuth,
+  loginRateLimiter,
+  asyncHandler(async (req, res) => {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      throw new HttpError(400, 'bad_request', 'currentPassword dan newPassword wajib diisi');
+    }
+    await AuthService.changeOwnPassword(req.user.id, currentPassword, newPassword);
+    res.json({ success: true });
+  })
+);
+
+module.exports = router;
