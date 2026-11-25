@@ -2,20 +2,13 @@
 
 ## Cara cepat (instalasi pertama)
 
-Laptop (Git Bash, folder proyek):
+Kode diambil langsung dari GitHub (`origin`, branch `master`). Di server, sbg root:
 
 ```bash
-bash deploy/pack.sh
-scp drs-secret-release.tar.gz root@156.67.219.118:/tmp/
+git clone -b master https://github.com/warastraadhiguna/drs-secret.git /var/www/drs-secret && bash /var/www/drs-secret/deploy/install.sh
 ```
 
-Server (sbg root):
-
-```bash
-mkdir -p /var/www/drs-secret && tar -xzf /tmp/drs-secret-release.tar.gz -C /var/www/drs-secret && bash /var/www/drs-secret/deploy/install.sh
-```
-
-`install.sh` mengerjakan semua langkah 0–8 di bawah secara otomatis (cuma
+`install.sh` mengerjakan semua langkah 0–8 (termasuk build admin panel) di bawah secara otomatis (cuma
 menanyakan email HTTPS & password root MariaDB). Bagian di bawah ini = rincian
 manual yang sama, utk referensi / kalau ada langkah yang gagal.
 
@@ -66,20 +59,18 @@ nginx -t
 
 ---
 
-## 1. Upload kode (dari LAPTOP, Git Bash di folder proyek)
+## 1. Ambil kode dari GitHub
 
 ```bash
-bash deploy/pack.sh
-scp drs-secret-release.tar.gz USER@IP_SERVER:/tmp/
+sudo git clone -b master https://github.com/warastraadhiguna/drs-secret.git /var/www/drs-secret
+ls /var/www/drs-secret     # harus ada: server  pos-admin  deploy  docs
+# admin panel di-build di server:
+cd /var/www/drs-secret/pos-admin && sudo npm ci && sudo npm run build
 ```
 
-Lalu di server:
-
-```bash
-sudo mkdir -p /var/www/drs-secret
-sudo tar -xzf /tmp/drs-secret-release.tar.gz -C /var/www/drs-secret
-ls /var/www/drs-secret     # harus ada: server  pos-admin  deploy
-```
+Repo private? `git clone` akan minta username GitHub & **Personal Access
+Token** (bukan password). Lebih rapi: pasang *deploy key* (SSH, read-only) di
+repo GitHub → Settings → Deploy keys, lalu clone via `git@github.com:...`.
 
 ---
 
@@ -216,15 +207,16 @@ Lalu buka `https://drs-secret.wan-client.com` di browser dan login `admin`.
 
 ## Update versi berikutnya
 
-Di laptop: `bash deploy/pack.sh` lalu `scp drs-secret-release.tar.gz USER@IP_SERVER:/tmp/`.
-Di server:
+Setelah perubahan di-push ke `origin master`, di server:
 
 ```bash
-sudo bash /var/www/drs-secret/deploy/update-on-server.sh /tmp/drs-secret-release.tar.gz
+sudo bash /var/www/drs-secret/deploy/update-on-server.sh
 ```
 
-Skrip itu: backup database dulu → ganti kode (`.env` & backups tidak disentuh) →
-`npm ci` → `npm run db:upgrade` (migrasi aman, tidak menghapus data) → `pm2 reload`.
+Skrip itu: tolak kalau ada kode yang diedit langsung di server → backup database →
+`git pull` (fast-forward `origin/master`) → build admin panel → `npm ci` →
+`npm run db:upgrade` (migrasi aman, tidak menghapus data) → `pm2 reload` → cek health.
+`.env` & `server/backups` tidak tersentuh (di `.gitignore`).
 
 ---
 

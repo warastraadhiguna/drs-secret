@@ -40,7 +40,7 @@ aplikasi kasir Electron (`pos-client-kasir`) sudah dihapus dari folder ini
 |---|---|
 | `server/` | Node.js + Express + MySQL — semua business logic & API. Juga menyajikan `pos-admin/dist` sebagai file statis. |
 | `pos-admin/` | React SPA (admin panel). Build dulu (`npm run build`), diakses lewat server yang sama. Base URL API relatif `/api`. |
-| `deploy/` | Deploy ke server produksi: `DEPLOY.md` (panduan), `pack.sh` (bungkus rilis di laptop), `update-on-server.sh`, config Nginx & pm2. |
+| `deploy/` | Deploy ke server produksi: `DEPLOY.md` (panduan), `install.sh` (instalasi pertama, otomatis), `update-on-server.sh` (git pull + build + db:upgrade + reload), config Nginx & pm2. |
 | `docs/` | Analisis kebutuhan + referensi proyek asal. |
 
 ## Menjalankan (lokal, Windows + WAMP)

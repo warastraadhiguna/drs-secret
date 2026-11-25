@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Instalasi PERTAMA DR's Secret di server (Ubuntu 22, Nginx, MariaDB, pm2).
-# Jalankan sbg root:   bash /var/www/drs-secret/deploy/install.sh
+# Jalankan sbg root, setelah kode di-clone dari GitHub:
+#   git clone -b master https://github.com/warastraadhiguna/drs-secret.git /var/www/drs-secret
+#   bash /var/www/drs-secret/deploy/install.sh
 #
 # Yang dikerjakan otomatis:
 #   cek server -> buat database & user -> buat .env (password acak) -> npm ci
-#   -> isi database awal -> pm2 -> Nginx -> HTTPS (certbot) -> verifikasi
+#   -> build admin panel -> isi database awal -> pm2 -> Nginx -> HTTPS (certbot) -> verifikasi
 # Yang ditanya: password root MariaDB (sekali) & email utk sertifikat HTTPS.
 #
 # Aman di server bersama: hanya MENAMBAH (database, user DB, vhost, proses pm2
@@ -27,10 +29,10 @@ warn() { echo -e "\e[33m[PERHATIAN]\e[0m $*"; }
 die()  { echo -e "\e[31m[GAGAL]\e[0m $*"; echo "Instalasi dihentikan. Kirim tampilan layar ini ke Claude."; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "Jalankan sebagai root (sudo -i dulu, lalu ulangi perintah)."
-[ -f "$APP_DIR/server/package.json" ] || die "Kode belum diekstrak ke $APP_DIR (lihat langkah sebelumnya)."
+[ -f "$APP_DIR/server/package.json" ] || die "Kode belum ada di $APP_DIR — clone dulu: git clone -b master https://github.com/warastraadhiguna/drs-secret.git $APP_DIR"
 if [ -f "$APP_DIR/server/.env" ]; then
   die "$APP_DIR/server/.env sudah ada — sudah pernah diinstal.
-  - Untuk UPDATE versi baru: bash $APP_DIR/deploy/update-on-server.sh /tmp/drs-secret-release.tar.gz
+  - Untuk UPDATE versi baru: bash $APP_DIR/deploy/update-on-server.sh
   - Untuk MENGULANG instalasi yang gagal (database masih kosong): rm $APP_DIR/server/.env  lalu jalankan skrip ini lagi."
 fi
 
@@ -122,7 +124,11 @@ umask 022
 ok "$APP_DIR/server/.env (hanya bisa dibaca root)"
 
 # -----------------------------------------------------------------------------
-info "6/9 Install & isi database awal"
+info "6/9 Install, build admin panel & isi database awal"
+cd "$APP_DIR/pos-admin"
+npm ci --no-audit --no-fund
+npm run build
+[ -f "$APP_DIR/pos-admin/dist/index.html" ] || die "Build admin panel gagal"
 cd "$APP_DIR/server"
 npm ci --omit=dev --no-audit --no-fund
 npm run db:migrate
@@ -135,7 +141,6 @@ ok "database terisi (COA, role, akun admin, pengaturan toko)"
 
 # -----------------------------------------------------------------------------
 info "7/9 Jalankan dengan pm2"
-sed -i "s#cwd: '/var/www/drs-secret/server'#cwd: '${APP_DIR}/server'#" "$APP_DIR/deploy/ecosystem.config.js"
 pm2 start "$APP_DIR/deploy/ecosystem.config.js"
 pm2 save
 for i in $(seq 1 20); do
@@ -193,6 +198,6 @@ cat <<DONE
 
  Konfigurasi : ${APP_DIR}/server/.env  (password database & kunci login)
  Log         : pm2 logs ${PM2_NAME}
- Update nanti: bash ${APP_DIR}/deploy/update-on-server.sh /tmp/drs-secret-release.tar.gz
+ Update nanti: bash ${APP_DIR}/deploy/update-on-server.sh
 =============================================================================
 DONE
